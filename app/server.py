@@ -10,6 +10,7 @@ Endpoints:
   GET  /api/exports/{id}               detail incl. journal + lease
   GET  /api/exports/{id}/artifact      download (only verified, published)
   POST /api/test/fault                 fault injection (TEST_HOOKS=1 only)
+  GET  /api/test/exports/{id}/artifacts  read-only artifact rows (TEST_HOOKS=1)
 """
 import json
 import os
@@ -163,6 +164,10 @@ class Handler(BaseHTTPRequestHandler):
         if match:
             self._download_artifact(match.group(1))
             return
+        match = re.fullmatch(r"/api/test/exports/([A-Za-z0-9._-]+)/artifacts", path)
+        if match:
+            self._get_test_artifact_records(match.group(1))
+            return
         self._send_error_json(404, "not_found", "no such route: %s" % path)
 
     def _serve_index(self):
@@ -223,6 +228,43 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _get_test_artifact_records(self, export_id):
+        """Read-only test hook: artifact rows plus whether each referenced
+        file still exists. Lets the acceptance run assert that a PUBLISHED
+        export has no staged record pointing at a live temp file, even though
+        the verify container mounts the data volume read-only."""
+        if not config.test_hooks():
+            self._send_error_json(404, "not_found", "test hooks disabled")
+            return
+        conn = store.connect()
+        try:
+            row = store.get_export(conn, export_id)
+            if not row:
+                self._send_error_json(404, "not_found", "unknown export_id: %s" % export_id)
+                return
+            rows = conn.execute(
+                "SELECT id, kind, path, digest, created_at FROM artifacts WHERE export_id = ? ORDER BY id",
+                (export_id,),
+            ).fetchall()
+            artifacts_rows = []
+            for r in rows:
+                path = r["path"]
+                artifacts_rows.append({
+                    "id": r["id"],
+                    "kind": r["kind"],
+                    "path": path,
+                    "digest": r["digest"],
+                    "file_exists": os.path.exists(path),
+                    "is_tmp": os.path.basename(path).endswith(".part"),
+                })
+        finally:
+            conn.close()
+        self._send_json(200, {
+            "export_id": export_id,
+            "stage": row["stage"],
+            "artifacts": artifacts_rows,
+        })
 
     # ------------------------------------------------------------ PUT/POST
     def _route_mutation(self, method, path, doc):

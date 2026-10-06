@@ -122,6 +122,49 @@ class CleanupTest(RecoveryTestBase):
         self.assertFalse(os.path.exists(orphan))
 
 
+class SettlePublishedTest(RecoveryTestBase):
+    def test_leftover_staged_record_after_publication_is_settled(self):
+        """Reproduces STALE_LEASE_TEMP_LEAK: a PUBLISHED export must never keep
+        a 'staged' record that points at a temp file still on disk."""
+        data = render_artifact_bytes(self.export())
+        digest = hashlib.sha256(data).hexdigest()
+        # Current owner published normally ...
+        published_tmp = artifacts.tmp_path("E-1", "owner")
+        artifacts.write_tmp(published_tmp, data)
+        artifacts.publish(published_tmp, artifacts.published_path("E-1"), digest)
+        with store.immediate(self.conn):
+            store.record_artifact(self.conn, "E-1", "published",
+                                  artifacts.published_path("E-1"), digest)
+            store.mark_published(self.conn, "E-1", digest,
+                                 artifacts.published_path("E-1"), "w-new", "linked")
+        # ... while a superseded worker had left a staged row + live temp file.
+        stale = artifacts.tmp_path("E-1", "stale")
+        artifacts.write_tmp(stale, data)
+        with store.immediate(self.conn):
+            store.record_artifact(self.conn, "E-1", "staged", stale, digest)
+
+        report = recovery.settle_published(self.conn, "E-1", "w-new")
+
+        self.assertEqual(1, report["aborted"])
+        self.assertIn(stale, report["removed"])
+        self.assertFalse(os.path.exists(stale))
+        self.assertEqual([], store.staged_artifacts(self.conn, "E-1"))
+        self.assertEqual("PUBLISHED", self.export()["stage"])
+        self.assertEqual([], artifacts.tmp_files_for("E-1"))
+
+    def test_settle_is_a_noop_before_publication(self):
+        data = render_artifact_bytes(self.export())
+        tmp = artifacts.tmp_path("E-1", "early")
+        artifacts.write_tmp(tmp, data)
+        with store.immediate(self.conn):
+            store.cas_stage(self.conn, "E-1", "PROCESSING", ("RECEIVED",))
+            store.record_artifact(self.conn, "E-1", "staged", tmp,
+                                  hashlib.sha256(data).hexdigest())
+        report = recovery.settle_published(self.conn, "E-1", "w-new")
+        self.assertEqual({"aborted": 0, "removed": []}, report)
+        self.assertTrue(os.path.exists(tmp))  # in-flight staging untouched
+
+
 class PublishPrimitiveTest(RecoveryTestBase):
     def test_publish_never_clobbers(self):
         a = artifacts.tmp_path("E-1", "a")

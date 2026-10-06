@@ -9,6 +9,11 @@ unfinished export, consult the journal/artifact records plus on-disk digests:
   atomic link and the DB update) -> converge the bookkeeping;
 * anything else (partial write, digest mismatch, missing file, orphans) ->
   clean up the残缺 artifacts and requeue the export.
+
+After convergence the export is settled: PUBLISHED is terminal, so any staged
+artifact records a superseded worker may have left behind are aborted and all
+temp files are removed -- no staged record may ever reference a live temp file
+once an export is published.
 """
 import hashlib
 import os
@@ -28,6 +33,30 @@ def _converge(conn, export_id, digest, actor, via):
         store.mark_published(conn, export_id, digest, artifacts.published_path(export_id), actor, via)
 
 
+def settle_published(conn, export_id, actor):
+    """Terminal-state cleanup for a PUBLISHED export.
+
+    Aborts every leftover 'staged' artifact row and removes every temp file of
+    the export. Safe to call from any path because it only acts when the export
+    has reached the terminal PUBLISHED stage, so it can never disturb another
+    worker's in-flight staging. Returns a small {'aborted', 'removed'} report.
+    """
+    export = store.get_export(conn, export_id)
+    if not export or export["stage"] != "PUBLISHED":
+        return {"aborted": 0, "removed": []}
+    removed = artifacts.cleanup_tmp_for(export_id)
+    with store.immediate(conn):
+        rows = store.staged_artifacts(conn, export_id)
+        for row in rows:
+            store.abort_artifact(conn, row["id"])
+        if rows or removed:
+            store.journal(
+                conn, export_id, actor, "published_residue_settled",
+                "aborted_staged=%d removed_tmp=%d" % (len(rows), len(removed)),
+            )
+    return {"aborted": len(rows), "removed": removed}
+
+
 def recover_export(conn, export_id, actor):
     """Recover one export. Caller must hold the export's lease."""
     export = store.get_export(conn, export_id)
@@ -40,7 +69,7 @@ def recover_export(conn, export_id, actor):
     if os.path.exists(pub):
         if artifacts.sha256_file(pub) == expected_digest:
             _converge(conn, export_id, expected_digest, actor, "recovery_published_file")
-            artifacts.cleanup_tmp_for(export_id)
+            settle_published(conn, export_id, actor)
             return "converged"
         target = artifacts.quarantine(pub)
         with store.immediate(conn):
@@ -55,7 +84,9 @@ def recover_export(conn, export_id, actor):
         ):
             artifacts.publish(path, pub, row["digest"])
             _converge(conn, export_id, row["digest"], actor, "recovery_staged_artifact")
-            artifacts.cleanup_tmp_for(export_id)
+            # Abort stale staged rows (e.g. a superseded worker's later record)
+            # and sweep all temp files; PUBLISHED must leave no reference.
+            settle_published(conn, export_id, actor)
             return "converged"
 
     # Case 3: incomplete/mismatched remains -> clean up and requeue.

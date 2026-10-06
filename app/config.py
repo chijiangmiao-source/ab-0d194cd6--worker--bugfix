@@ -43,6 +43,13 @@ def test_hooks():
     return os.environ.get("TEST_HOOKS", "") == "1"
 
 
+def fault_pause_timeout_seconds():
+    """Bound for the pause_before_tmp_write fault: how long the frozen worker
+    waits to observe the lease handover. Default comfortably exceeds the
+    takeover window (poll interval + recovery)."""
+    return float(os.environ.get("FAULT_PAUSE_TIMEOUT_SECONDS", "60"))
+
+
 def ensure_dirs():
     for path in (data_dir(), tmp_dir(), published_dir(), quarantine_dir()):
         os.makedirs(path, exist_ok=True)

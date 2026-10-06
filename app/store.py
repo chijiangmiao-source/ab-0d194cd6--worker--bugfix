@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS faults (
 
 DEFAULT_RULES = {"rules": [{"field": "vessel_id", "action": "hash", "length": 12}]}
 
-FAULT_MODES = ("crash_partial_write", "crash_after_staged")
+FAULT_MODES = ("crash_partial_write", "crash_after_staged", "pause_before_tmp_write")
 
 
 def utcnow():

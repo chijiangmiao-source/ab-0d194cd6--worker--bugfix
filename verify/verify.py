@@ -93,6 +93,18 @@ def download(export_id):
     return req("GET", "/api/exports/%s/artifact" % export_id)
 
 
+def artifact_records(export_id):
+    """Read-only test hook: artifact rows with file-existence flags.
+
+    The data volume is mounted read-only for the verify container, so this is
+    how the acceptance run proves no staged record points at a live temp file.
+    """
+    status, raw, _ = req("GET", "/api/test/exports/%s/artifacts" % export_id)
+    if status != 200:
+        return None
+    return as_json(raw)
+
+
 # ------------------------------------------------------------------ phases
 
 def build_checks():
@@ -136,7 +148,7 @@ def wait_for_api():
 
 
 def smoke():
-    e1, e2, e3, e4, e5 = ("VFY%d-%s" % (i, RUN) for i in range(1, 6))
+    e1, e2, e3, e4, e5, e6 = ("VFY%d-%s" % (i, RUN) for i in range(1, 7))
     recs = [
         {"ts": "2026-10-06T01:00:00Z", "lat": 31.230416, "lon": 121.473701, "depth_m": 42.51, "vessel_id": "HAICE-01"},
         {"ts": "2026-10-06T01:05:00Z", "lat": 31.231102, "lon": 121.480233, "depth_m": 43.04, "vessel_id": "HAICE-01"},
@@ -274,6 +286,49 @@ def smoke():
         check("E4 download verified", status == 200
               and hashlib.sha256(raw).hexdigest() == detail4["artifact_digest"])
 
+    step("租约交接回归：旧 worker 首次临时写入前暂停 → 新 worker 接管发布 → 旧 worker 失租")
+    # The old worker moves E6 to PROCESSING, then blocks at the
+    # pause_before_tmp_write seam while its lease expires. A second worker
+    # takes over, recovers/reprocesses and publishes. When the frozen worker
+    # resumes, it must finish as lease_lost and must never leave a staged
+    # artifact record that references a real temp file (STALE_LEASE_TEMP_LEAK).
+    status, raw, _ = req("POST", "/api/test/fault", {"export_id": e6, "mode": "pause_before_tmp_write"})
+    check("arm fault pause_before_tmp_write", status == 202, "HTTP %s %s" % (status, raw[:200]))
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e6, "records": recs})
+    check("submit E6 -> 201", status == 201, "HTTP %s %s" % (status, raw[:300]))
+    detail6 = wait_for_stage(e6, "PUBLISHED", 150)
+    check("E6 published after lease handover", detail6 is not None and detail6["stage"] == "PUBLISHED",
+          "last=%s" % (detail6 and detail6.get("stage")))
+    # Give the frozen old worker time to observe the handover, resume, hit the
+    # fencing gate and record its lease_lost outcome.
+    deadline = time.time() + 30
+    saw_lease_lost = False
+    while time.time() < deadline:
+        d = wait_for_stage(e6, "PUBLISHED", 1)
+        events = (d or {}).get("events", [])
+        if any(e.get("event") == "lease_lost" for e in events):
+            saw_lease_lost = True
+            break
+        time.sleep(0.5)
+    check("E6 stale worker result handled as lease_lost", saw_lease_lost)
+    if detail6:
+        status, raw, _ = download(e6)
+        check("E6 download verified", status == 200
+              and hashlib.sha256(raw).hexdigest() == detail6["artifact_digest"])
+        check("exactly one published artifact file for E6", len(published_files(e6)) == 1)
+        check("no temp leftovers for E6", tmp_files(e6) == [], str(tmp_files(e6)))
+    records6 = artifact_records(e6)
+    check("artifact records readable (test hook)", records6 is not None)
+    if records6:
+        kinds = {}
+        for r in records6["artifacts"]:
+            kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
+        stale = [r for r in records6["artifacts"]
+                 if r["kind"] == "staged" and r["file_exists"] and r["is_tmp"]]
+        check("E6 has one published artifact row", kinds.get("published") == 1, str(kinds))
+        check("E6 no staged record points at a real temp file (STALE_LEASE_TEMP_LEAK)",
+              stale == [], str(stale))
+
     step("下载接口不暴露未核验内容（崩溃窗口内只能 409，不能 200）")
     req("POST", "/api/test/fault", {"export_id": e5, "mode": "crash_partial_write"})
     status, raw, _ = req("POST", "/api/exports", {"export_id": e5, "records": recs})
@@ -308,7 +363,7 @@ def smoke():
 
     step("终态检查：无残缺临时工件残留")
     leftovers = []
-    for eid in (e1, e2, e3, e4, e5):
+    for eid in (e1, e2, e3, e4, e5, e6):
         leftovers.extend(tmp_files(eid))
     check("no temp artifacts left behind", leftovers == [], str(leftovers))
 
