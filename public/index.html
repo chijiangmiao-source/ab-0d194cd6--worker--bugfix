@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>航迹导出值班台 · Track Export Console</title>
+<style>
+  :root { --ink:#17202a; --muted:#6b7684; --line:#d8dee6; --bg:#f5f7fa; --card:#ffffff;
+          --ok:#0f7b3d; --warn:#9a6a00; --bad:#b3261e; --info:#0b5cad; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+         color:var(--ink); background:var(--bg); }
+  header { background:#0d2b45; color:#fff; padding:14px 22px; }
+  header h1 { margin:0; font-size:17px; font-weight:600; }
+  header p { margin:2px 0 0; font-size:12px; color:#9fb8cf; }
+  main { max-width:1180px; margin:18px auto; padding:0 16px; display:grid; gap:16px;
+         grid-template-columns: 1fr 1fr; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+  section.wide { grid-column: 1 / -1; }
+  h2 { margin:0 0 10px; font-size:14px; }
+  label { display:block; font-size:12px; color:var(--muted); margin:8px 0 4px; }
+  textarea, input[type=text] { width:100%; font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+         border:1px solid var(--line); border-radius:6px; padding:8px; background:#fbfcfe; color:var(--ink); }
+  textarea { min-height:120px; resize:vertical; }
+  button { margin-top:10px; padding:7px 14px; border:0; border-radius:6px; background:var(--info); color:#fff;
+           font-size:13px; cursor:pointer; }
+  button:hover { filter:brightness(1.08); }
+  .meta { font-size:12px; color:var(--muted); margin-top:8px; word-break:break-all; }
+  .meta b { color:var(--ink); font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; white-space:nowrap; }
+  td.mono, .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+  .st-RECEIVED  { background:#e8eef7; color:var(--info); }
+  .st-PROCESSING, .st-STAGED { background:#fff3d6; color:var(--warn); }
+  .st-PUBLISHED { background:#dff2e5; color:var(--ok); }
+  pre { background:#0f1620; color:#d7e3f4; border-radius:6px; padding:10px; font-size:11.5px;
+        max-height:260px; overflow:auto; white-space:pre-wrap; word-break:break-all; }
+  .err { color:var(--bad); } .ok { color:var(--ok); }
+  a { color:var(--info); }
+  .row { display:flex; gap:16px; } .row > div { flex:1; }
+  #events { font-size:11.5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>航迹导出值班台</h1>
+  <p>编辑字段遮蔽规则 → 提交带稳定标识的航迹记录 → 轮询处理阶段 / 冻结规则摘要 / 已发布工件摘要</p>
+</header>
+<main>
+  <section>
+    <h2>① 当前字段遮蔽规则</h2>
+    <label for="rules">规则 JSON（redact / round / hash / drop）</label>
+    <textarea id="rules" spellcheck="false"></textarea>
+    <button id="saveRules">保存规则</button>
+    <div class="meta" id="rulesMeta">加载中…</div>
+    <div class="meta" id="rulesMsg"></div>
+  </section>
+
+  <section>
+    <h2>② 提交导出（稳定标识 + 少量 JSON 记录）</h2>
+    <label for="exportId">导出标识 export_id</label>
+    <input type="text" id="exportId" value="">
+    <label for="records">航迹记录（JSON 数组，1–100 条）</label>
+    <textarea id="records" spellcheck="false"></textarea>
+    <button id="submitExport">提交导出</button>
+    <div class="meta" id="submitMsg"></div>
+    <pre id="submitResult" hidden></pre>
+  </section>
+
+  <section class="wide">
+    <h2>③ 导出列表（每 2 秒轮询真实 API）</h2>
+    <table>
+      <thead><tr>
+        <th>导出标识</th><th>阶段</th><th>冻结规则摘要</th><th>输入摘要</th>
+        <th>已发布工件摘要</th><th>尝试</th><th>更新时间</th><th>操作</th>
+      </tr></thead>
+      <tbody id="rows"><tr><td colspan="8" class="meta">加载中…</td></tr></tbody>
+    </table>
+  </section>
+
+  <section class="wide">
+    <h2>④ 处理日志 / 租约 <span class="meta" id="detailFor"></span></h2>
+    <div id="lease" class="meta"></div>
+    <pre id="events">点击列表中的“日志”查看。</pre>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const short = (d) => d ? d.slice(0, 12) + "…" : "—";
+
+async function api(method, path, body) {
+  const opt = { method, headers: {} };
+  if (body !== undefined) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  const resp = await fetch(path, opt);
+  const text = await resp.text();
+  let data; try { data = JSON.parse(text); } catch { data = text; }
+  return { status: resp.status, data };
+}
+
+async function loadRules() {
+  const { status, data } = await api("GET", "/api/rules");
+  if (status === 200) {
+    $("rules").value = JSON.stringify(data.rules, null, 2);
+    $("rulesMeta").innerHTML = "版本 <b>v" + data.version + "</b> · 摘要 <b class='mono'>" + data.digest + "</b> · 更新于 " + data.updated_at;
+  }
+}
+
+$("saveRules").onclick = async () => {
+  $("rulesMsg").textContent = "";
+  let doc;
+  try { doc = JSON.parse($("rules").value); }
+  catch (e) { $("rulesMsg").innerHTML = "<span class='err'>JSON 解析失败：" + e.message + "</span>"; return; }
+  const { status, data } = await api("PUT", "/api/rules", doc);
+  if (status === 200) {
+    $("rulesMsg").innerHTML = "<span class='ok'>已保存 → v" + data.version + "（摘要 " + short(data.digest) + "）。注意：已冻结的导出不受此影响。</span>";
+    loadRules();
+  } else {
+    $("rulesMsg").innerHTML = "<span class='err'>保存失败：" + (data.message || status) + "</span>";
+  }
+};
+
+$("submitExport").onclick = async () => {
+  $("submitMsg").textContent = ""; $("submitResult").hidden = true;
+  let records;
+  try { records = JSON.parse($("records").value); }
+  catch (e) { $("submitMsg").innerHTML = "<span class='err'>记录 JSON 解析失败：" + e.message + "</span>"; return; }
+  const payload = { export_id: $("exportId").value.trim(), records };
+  const { status, data } = await api("POST", "/api/exports", payload);
+  $("submitResult").hidden = false;
+  $("submitResult").textContent = "HTTP " + status + "\n" + JSON.stringify(data, null, 2);
+  if (status === 201) $("submitMsg").innerHTML = "<span class='ok'>已受理（新裁决已冻结）。</span>";
+  else if (status === 200) $("submitMsg").innerHTML = "<span class='ok'>业务等价重传：返回首次回执，不产生第二个工件。</span>";
+  else if (status === 409) $("submitMsg").innerHTML = "<span class='err'>冲突：记录或规则快照与已冻结裁决不同，原有证据已保留。</span>";
+  else $("submitMsg").innerHTML = "<span class='err'>提交失败。</span>";
+  refreshExports();
+};
+
+async function refreshExports() {
+  const { status, data } = await api("GET", "/api/exports");
+  if (status !== 200) return;
+  const rows = data.exports.map(e => {
+    const dl = e.stage === "PUBLISHED"
+      ? `<a href="/api/exports/${encodeURIComponent(e.export_id)}/artifact">下载</a>` : "—";
+    return `<tr>
+      <td class="mono">${e.export_id}</td>
+      <td><span class="badge st-${e.stage}">${e.stage}</span></td>
+      <td class="mono" title="${e.rules_digest}">${short(e.rules_digest)} (v${e.rules_version})</td>
+      <td class="mono" title="${e.input_digest}">${short(e.input_digest)}</td>
+      <td class="mono" title="${e.artifact_digest || ""}">${short(e.artifact_digest)}</td>
+      <td>${e.attempts}</td>
+      <td class="mono">${e.updated_at}</td>
+      <td>${dl} · <a href="#" onclick="showDetail('${e.export_id}');return false;">日志</a></td>
+    </tr>`;
+  }).join("");
+  $("rows").innerHTML = rows || `<tr><td colspan="8" class="meta">暂无导出。</td></tr>`;
+}
+
+async function showDetail(exportId) {
+  const { status, data } = await api("GET", "/api/exports/" + encodeURIComponent(exportId));
+  if (status !== 200) return;
+  $("detailFor").textContent = "— " + exportId;
+  $("lease").innerHTML = data.lease
+    ? "当前租约持有者：<b class='mono'>" + data.lease.owner + "</b>（fencing=" + data.lease.fencing + "，到期 " + new Date(data.lease.expires_at * 1000).toISOString() + "）"
+    : "当前无有效租约。";
+  $("events").textContent = data.events.map(e => `${e.ts}  [${e.actor}]  ${e.event}${e.detail ? "  — " + e.detail : ""}`).join("\n") || "（无事件）";
+}
+window.showDetail = showDetail;
+
+// 预填示例
+$("exportId").value = "TRACK-" + new Date().toISOString().slice(0,10).replaceAll("-","") + "-001";
+$("records").value = JSON.stringify([
+  { ts: "2026-10-06T01:00:00Z", lat: 31.230416, lon: 121.473701, depth_m: 42.51, vessel_id: "HAICE-01" },
+  { ts: "2026-10-06T01:05:00Z", lat: 31.231102, lon: 121.480233, depth_m: 43.04, vessel_id: "HAICE-01" },
+  { ts: "2026-10-06T01:10:00Z", lat: 31.231877, lon: 121.486912, depth_m: 42.87, vessel_id: "HAICE-01" }
+], null, 2);
+
+loadRules();
+refreshExports();
+setInterval(refreshExports, 2000);   // 真实 API 轮询
+setInterval(loadRules, 10000);
+</script>
+</body>
+</html>

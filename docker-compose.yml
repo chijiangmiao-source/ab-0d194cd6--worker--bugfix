@@ -1,0 +1,52 @@
+name: track-export
+
+services:
+  app:
+    build: .
+    command: ["python", "-m", "app.server"]
+    environment:
+      PORT: "8080"
+      DATA_DIR: /data
+      TEST_HOOKS: "1"          # enables /api/test/fault for the acceptance run; set 0 in production
+    volumes:
+      - data:/data
+    ports:
+      - "${APP_PORT:-8080}:8080"   # configurable host port
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATA_DIR: /data
+      TEST_HOOKS: "1"
+      LEASE_TTL_SECONDS: "8"
+      POLL_INTERVAL_SECONDS: "0.5"
+    volumes:
+      - data:/data
+    restart: on-failure        # crashed workers restart and run recovery
+    deploy:
+      replicas: 2              # two parallel worker processes
+
+  verify:
+    build: .
+    command: ["python", "-m", "verify.verify"]
+    depends_on:
+      app:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    environment:
+      API_BASE: "http://app:8080"
+      DATA_DIR: /data
+    volumes:
+      - data:/data:ro
+    restart: "no"              # one-shot: runs the acceptance suite and exits
+
+volumes:
+  data:
