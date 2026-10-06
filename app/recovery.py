@@ -26,6 +26,9 @@ def _converge(conn, export_id, digest, actor, via):
     with store.immediate(conn):
         store.record_artifact(conn, export_id, "published", artifacts.published_path(export_id), digest)
         store.mark_published(conn, export_id, digest, artifacts.published_path(export_id), actor, via)
+        # PUBLISHED is terminal: staged records are superseded and must not
+        # stay referenceable.
+        store.abort_staged(conn, export_id)
 
 
 def recover_export(conn, export_id, actor):

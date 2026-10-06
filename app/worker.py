@@ -2,8 +2,11 @@
 
 Loop: recover stuck exports (lease expired/absent) -> process one RECEIVED
 export. Processing stages the artifact to a temp file, records and verifies
-its digest, then atomically publishes. Fault-injection hooks (TEST_HOOKS)
-simulate a crash after a partial write or after staging.
+its digest, then atomically publishes. The lease (fencing token) is
+re-checked before every mutation — temp write, staged registration, publish —
+so a worker whose lease was taken over never writes or registers artifacts.
+Fault-injection hooks (TEST_HOOKS) simulate a crash after a partial write or
+after staging.
 """
 import hashlib
 import os
@@ -14,6 +17,12 @@ import uuid
 
 from . import artifacts, config, recovery, store
 from .render import render_artifact_bytes
+
+# Test-only seams (must stay None in production): pause points around the
+# first temp write, called as hook(export_id, worker_identity), so tests can
+# reproduce lease-handover interleavings deterministically.
+before_tmp_write_hook = None
+after_tmp_write_hook = None
 
 
 def identity():
@@ -49,12 +58,34 @@ def process_export(conn, export_id, me, fencing):
             store.journal(conn, export_id, me, "fault_partial_write", tmp)
         _crash(me, export_id, "crash_partial_write")
 
+    if before_tmp_write_hook is not None:
+        before_tmp_write_hook(export_id, me)
+
+    # Fencing: a worker whose lease was taken over must not write anything.
+    if not store.check_lease(conn, lease_resource(export_id), me, fencing):
+        with store.immediate(conn):
+            store.journal(conn, export_id, me, "lease_lost", None)
+        return "lease_lost"
+
     artifacts.write_tmp(tmp, data)
 
+    if after_tmp_write_hook is not None:
+        after_tmp_write_hook(export_id, me)
+
+    # Register the staged artifact only while still holding the lease: the
+    # fencing check and the registration commit in one transaction, so a
+    # stale worker can never leave a staged record behind.
     with store.immediate(conn):
-        store.record_artifact(conn, export_id, "staged", tmp, digest)
-        store.cas_stage(conn, export_id, "STAGED", ("PROCESSING",))
-        store.journal(conn, export_id, me, "staged", "digest=%s path=%s" % (digest, tmp))
+        lease_held = store.check_lease(conn, lease_resource(export_id), me, fencing)
+        if lease_held:
+            store.record_artifact(conn, export_id, "staged", tmp, digest)
+            store.cas_stage(conn, export_id, "STAGED", ("PROCESSING",))
+            store.journal(conn, export_id, me, "staged", "digest=%s path=%s" % (digest, tmp))
+    if not lease_held:
+        artifacts.discard_tmp(tmp)
+        with store.immediate(conn):
+            store.journal(conn, export_id, me, "lease_lost", None)
+        return "lease_lost"
 
     # Fault: die after the staged artifact + digest are durably recorded.
     if store.pop_fault(conn, export_id, "crash_after_staged"):
@@ -70,9 +101,13 @@ def process_export(conn, export_id, me, fencing):
             store.requeue(conn, export_id, me, "digest mismatch after staging")
         return "verify_failed"
 
-    # Fencing: only the valid lease holder may publish.
+    # Fencing: only the valid lease holder may publish. A stale worker drops
+    # the temp file and the staged record it registered itself, so nothing
+    # it staged stays referenceable after the takeover.
     if not store.check_lease(conn, lease_resource(export_id), me, fencing):
+        artifacts.discard_tmp(tmp)
         with store.immediate(conn):
+            store.abort_staged_by_path(conn, export_id, tmp)
             store.journal(conn, export_id, me, "lease_lost", None)
         return "lease_lost"
 
@@ -80,6 +115,10 @@ def process_export(conn, export_id, me, fencing):
     with store.immediate(conn):
         store.record_artifact(conn, export_id, "published", artifacts.published_path(export_id), digest)
         store.mark_published(conn, export_id, digest, artifacts.published_path(export_id), me, via)
+        # PUBLISHED is terminal: staged records are superseded and must not
+        # stay referenceable.
+        store.abort_staged(conn, export_id)
+    artifacts.cleanup_tmp_for(export_id)
     return "published"
 
 

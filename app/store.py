@@ -361,6 +361,22 @@ def abort_artifact(conn, artifact_id):
     conn.execute("UPDATE artifacts SET kind = 'aborted' WHERE id = ? AND kind = 'staged'", (artifact_id,))
 
 
+def abort_staged(conn, export_id):
+    """Abort every staged record of an export (superseded once published)."""
+    conn.execute(
+        "UPDATE artifacts SET kind = 'aborted' WHERE export_id = ? AND kind = 'staged'",
+        (export_id,),
+    )
+
+
+def abort_staged_by_path(conn, export_id, path):
+    """Abort one staged record by path (a stale worker dropping its own)."""
+    conn.execute(
+        "UPDATE artifacts SET kind = 'aborted' WHERE export_id = ? AND path = ? AND kind = 'staged'",
+        (export_id, path),
+    )
+
+
 # ---------------------------------------------------------------- work queues
 
 def stuck_exports(conn):

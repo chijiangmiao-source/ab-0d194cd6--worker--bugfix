@@ -99,6 +99,14 @@ def tmp_files_for(export_id):
     return out
 
 
+def discard_tmp(path):
+    """Best-effort removal of a temp file we wrote ourselves (already gone is fine)."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 def cleanup_tmp_for(export_id):
     removed = []
     for path in tmp_files_for(export_id):
